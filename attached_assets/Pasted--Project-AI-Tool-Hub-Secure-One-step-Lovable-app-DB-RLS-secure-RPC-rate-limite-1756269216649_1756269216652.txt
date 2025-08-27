@@ -1,0 +1,240 @@
+# === Project: AI Tool Hub (Secure) ===
+# One-step Lovable app: DB + RLS + secure RPC + rate-limited backend + CORS + UI
+
+# -------------------------------
+# 0) REQUIRED SECRETS / SETTINGS
+# -------------------------------
+secrets:
+  SUPABASE_SERVICE_ROLE: "<paste your Supabase service role key>"   # NOT exposed to browser
+  FRONTEND_ORIGIN: "https://aihub.lovable.dev"                      # change to your domain
+
+# --------------------------------
+# 1) Database Schema + Security
+# --------------------------------
+sql:
+  -- Core table
+  create table if not exists ai_tools (
+    id          bigserial primary key,
+    name        text not null,
+    url         text not null,
+    description text,
+    image_url   text,
+    category    text,
+    last_seen   timestamptz default now()
+  );
+
+  -- Helpful indexes (search & filtering fast)
+  create index if not exists idx_ai_tools_name_trgm     on ai_tools using gin (name gin_trgm_ops);
+  create index if not exists idx_ai_tools_category      on ai_tools (category);
+  alter table ai_tools add column if not exists tsv tsvector;
+  update ai_tools set tsv = to_tsvector('simple', coalesce(name,'') || ' ' || coalesce(description,''));
+  create index if not exists idx_ai_tools_tsv on ai_tools using gin (tsv);
+
+  -- Keep tsvector updated
+  create or replace function ai_tools_tsv_refresh() returns trigger as $$
+  begin
+    new.tsv := to_tsvector('simple', coalesce(new.name,'') || ' ' || coalesce(new.description,''));
+    return new;
+  end $$ language plpgsql;
+  drop trigger if exists trg_ai_tools_tsv on ai_tools;
+  create trigger trg_ai_tools_tsv before insert or update on ai_tools
+  for each row execute function ai_tools_tsv_refresh();
+
+  -- Enable Row Level Security (RLS)
+  alter table ai_tools enable row level security;
+
+  -- Read-only public: allow SELECT for everyone (anon). No INSERT/UPDATE/DELETE policies -> writes blocked.
+  drop policy if exists p_ai_tools_public_read on ai_tools;
+  create policy p_ai_tools_public_read on ai_tools
+    for select using (true);
+
+  -- Public view (optional, mirrors table; useful if you later add private columns)
+  create or replace view ai_tools_public as
+  select id, name, url, description, image_url, category, last_seen
+  from ai_tools;
+
+  -- SECURE SEARCH: server-side RPC with clamped limit/offset. Uses ILIKE + FTS.
+  create or replace function public.search_tools_secure(
+    q text default '',
+    cat text default null,
+    page_limit int default 24,
+    page_offset int default 0
+  )
+  returns setof ai_tools_public
+  language sql
+  security definer
+  set search_path = public
+  as $$
+    with params as (
+      select
+        coalesce(q,'') as q,
+        nullif(cat,'') as cat,
+        greatest(1, least(coalesce(page_limit, 24), 48)) as lim,   -- hard cap 48
+        greatest(0, coalesce(page_offset, 0)) as off
+    ),
+    base as (
+      select t.*
+      from ai_tools t, params p
+      where
+        (
+          p.q = '' or
+          t.tsv @@ plainto_tsquery('simple', p.q) or
+          t.name ilike '%' || p.q || '%' or
+          t.description ilike '%' || p.q || '%'
+        )
+        and (p.cat is null or t.category = p.cat)
+    )
+    select id, name, url, description, image_url, category, last_seen
+    from base
+    order by last_seen desc, id desc
+    limit (select lim from params) offset (select off from params);
+  $$;
+
+  -- Categories list (distinct)
+  create or replace function public.list_categories()
+  returns table(category text)
+  language sql
+  security definer
+  set search_path = public
+  as $$
+    select category from ai_tools
+    where category is not null and category <> ''
+    group by category
+    order by category;
+  $$;
+
+  -- Seed dataset (concise starter; expand any time)
+  insert into ai_tools (name,url,description,category,image_url) values
+  ('ChatGPT','https://chat.openai.com','AI chatbot for text generation','Text','https://logo.clearbit.com/openai.com'),
+  ('Claude','https://anthropic.com','Helpful AI assistant by Anthropic','Text','https://logo.clearbit.com/anthropic.com'),
+  ('Perplexity AI','https://perplexity.ai','Answer engine with citations','Search','https://logo.clearbit.com/perplexity.ai'),
+  ('Midjourney','https://midjourney.com','Text-to-image for creative visuals','Images','https://logo.clearbit.com/midjourney.com'),
+  ('Stable Diffusion','https://stability.ai','Open image generation models','Images','https://logo.clearbit.com/stability.ai'),
+  ('Runway','https://runwayml.com','Generative video editing','Video','https://logo.clearbit.com/runwayml.com'),
+  ('Synthesia','https://synthesia.io','AI avatar video generator','Video','https://logo.clearbit.com/synthesia.io'),
+  ('Jasper','https://jasper.ai','AI writing for marketing','Productivity','https://logo.clearbit.com/jasper.ai'),
+  ('Copy.ai','https://copy.ai','AI copy for blogs and ads','Productivity','https://logo.clearbit.com/copy.ai'),
+  ('GitHub Copilot','https://github.com/features/copilot','AI code completion in your IDE','Developer Tools','https://logo.clearbit.com/github.com');
+
+# --------------------------------
+# 2) Secure Backend (Rate limit + CORS + RPC)
+# --------------------------------
+backend:
+  cors:
+    allow_origins:
+      - $FRONTEND_ORIGIN
+    allow_methods: ["GET"]
+    allow_headers: ["Content-Type", "Authorization"]
+  rate_limit:
+    window_ms: 60000         # 60s window
+    max: 60                  # 60 requests / minute / IP
+    message: "Rate limit exceeded. Please slow down."
+
+  - name: get_tools
+    method: GET
+    path: /api/tools
+    handler: sql
+    query: |
+      -- Use secure RPC with pagination
+      select * from search_tools_secure(
+        q := :search,
+        cat := :category,
+        page_limit := :limit,
+        page_offset := :offset
+      );
+    params:
+      - name: search
+        in: query
+        required: false
+      - name: category
+        in: query
+        required: false
+      - name: limit
+        in: query
+        required: false
+        default: 24
+      - name: offset
+        in: query
+        required: false
+        default: 0
+
+  - name: get_categories
+    method: GET
+    path: /api/categories
+    handler: sql
+    query: |
+      select * from list_categories();
+
+# --------------------------------
+# 3) Frontend UI (Search + Dynamic Filters)
+# --------------------------------
+ui:
+  - page: Home
+    layout:
+      type: vertical
+      className: "max-w-6xl mx-auto p-6 space-y-6"
+      children:
+        - component: header
+          text: "⚡ AI Tool Hub"
+          subtext: "Secure, fast directory — search and filter 100% server-side"
+        - component: group
+          className: "flex flex-col md:flex-row gap-3"
+          children:
+            - component: input
+              id: search
+              placeholder: "Search AI tools..."
+              debounceMs: 300
+            - component: select
+              id: category_filter
+              placeholder: "All categories"
+              source: get_categories
+              map:
+                label: category
+                value: category
+            - component: select
+              id: page_size
+              placeholder: "24 per page"
+              options:
+                - { label: "12 per page", value: 12 }
+                - { label: "24 per page", value: 24 }
+                - { label: "36 per page", value: 36 }
+                - { label: "48 per page", value: 48 }
+        - component: grid
+          id: tool_grid
+          source: get_tools
+          params:
+            search: $search.value
+            category: $category_filter.value
+            limit: $page_size.value || 24
+            offset: $pagination.offset
+          columns: 3
+          card:
+            image: image_url
+            title: name
+            description: description
+            badge: category
+            link: url
+          emptyState: "No tools found. Try a different search or category."
+        - component: pagination
+          id: pagination
+          pageSizeSource: $page_size.value || 24
+          totalHint: "estimated"   # avoids heavy COUNT(*) scans
+
+# --------------------------------
+# 4) Deployment + SEO
+# --------------------------------
+deploy:
+  url: "https://aihub.lovable.dev"
+  seo:
+    title: "AI Tool Hub — Secure Searchable Directory"
+    description: "Browse AI tools with secure, rate-limited APIs and RLS-protected data. Fast search, dynamic categories."
+
+# --------------------------------
+# 5) Ops Notes (for you)
+# --------------------------------
+# - RLS is ON: public can only SELECT. No write policies exist, so anon cannot modify data.
+# - Service role (server key) bypasses RLS for future ingest/scrapers; keep SUPABASE_SERVICE_ROLE secret in Lovable.
+# - CORS restricted to FRONTEND_ORIGIN; change when you use your own domain.
+# - Rate limit: 60 req/min/IP. Adjust in backend.rate_limit.
+# - Search is server-side via RPC with hard max page size (48) and offset pagination.
+# - Indexes added for speed; FTS + trigram on name.

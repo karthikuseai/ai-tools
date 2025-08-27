@@ -1,0 +1,79 @@
+# === Project: AI Tool Hub ===
+# End-to-end Lovable app: DB + Scraper-ready + Frontend UI + Search + Filters
+
+# 1. Connect Supabase (green button top-right before running this)
+
+# 2. Database Schema (Supabase)
+sql:
+  create table if not exists ai_tools (
+    id serial primary key,
+    name text not null,
+    url text not null,
+    description text,
+    image_url text,
+    category text,
+    last_seen timestamp default now()
+  );
+
+  insert into ai_tools (name, url, description, category, image_url) values
+  ('ChatGPT', 'https://chat.openai.com', 'AI chatbot for text generation', 'Text', 'https://logo.clearbit.com/openai.com'),
+  ('Runway', 'https://runwayml.com', 'AI for video editing and generative video', 'Images', 'https://logo.clearbit.com/runwayml.com'),
+  ('Jasper', 'https://jasper.ai', 'AI writing assistant for content marketing', 'Productivity', 'https://logo.clearbit.com/jasper.ai'),
+  ('Copy.ai', 'https://copy.ai', 'AI content generator for social and blogs', 'Productivity', 'https://logo.clearbit.com/copy.ai'),
+  ('Midjourney', 'https://midjourney.com', 'Text-to-image AI for creative visuals', 'Images', 'https://logo.clearbit.com/midjourney.com'),
+  ('Synthesia', 'https://synthesia.io', 'AI avatar video generator', 'Video', 'https://logo.clearbit.com/synthesia.io'),
+  ('Descript', 'https://descript.com', 'AI video & audio editing with overdub', 'Video', 'https://logo.clearbit.com/descript.com'),
+  ('Notion AI', 'https://notion.so', 'AI writing + productivity inside Notion', 'Productivity', 'https://logo.clearbit.com/notion.so'),
+  ('Pictory', 'https://pictory.ai', 'AI to turn long content into short videos', 'Video', 'https://logo.clearbit.com/pictory.ai'),
+  ('Perplexity AI', 'https://perplexity.ai', 'AI-powered search engine', 'Search', 'https://logo.clearbit.com/perplexity.ai');
+
+# 3. Backend (API Endpoints)
+backend:
+  - name: get_tools
+    query: |
+      select * from ai_tools
+      where
+        (name ilike '%' || coalesce(:search, '') || '%'
+         or description ilike '%' || coalesce(:search, '') || '%')
+        and (:category is null or category = :category)
+      order by last_seen desc;
+
+  - name: get_categories
+    query: |
+      select distinct category from ai_tools where category is not null order by category;
+
+# 4. Frontend UI (Lovable Pages)
+ui:
+  - page: Home
+    layout:
+      type: vertical
+      children:
+        - component: header
+          text: "⚡ AI Tool Hub"
+        - component: input
+          id: search
+          placeholder: "Search AI tools..."
+        - component: dynamic-filter
+          id: category_filter
+          source: get_categories
+          display: category
+          value: category
+        - component: grid
+          source: get_tools
+          params:
+            search: $search.value
+            category: $category_filter.value
+          columns: 3
+          card:
+            image: image_url
+            title: name
+            description: description
+            badge: category
+            link: url
+
+# 5. Deployment
+deploy:
+  url: "https://aihub.lovable.dev"
+  seo:
+    title: "AI Tool Hub"
+    description: "Discover the best AI tools for text, images, video, and productivity. Updated daily."

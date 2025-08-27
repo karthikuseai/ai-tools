@@ -1,0 +1,281 @@
+# === Project: AI Tool Hub — Secure + Universal Scraper (One Paste) ===
+# Everything in one bundle:
+# - Postgres schema, indexes, RLS (read-only public)
+# - Secure SQL RPCs (search, list categories, bulk upsert)
+# - Backend:
+#     * Public GET APIs (search, categories) — rate-limited, CORS-allowlisted
+#     * Private POST /api/admin/refresh — universal anchor+tag scraper (Puppeteer + Cheerio)
+# - UI: search + dynamic category filters + grid
+# - Copyright-safe: neutral descriptions + Clearbit logos only
+# - Cap: up to 5000 tools per ingest
+
+# -------------------------------
+# 0) REQUIRED SECRETS / SETTINGS
+# -------------------------------
+secrets:
+  SUPABASE_URL: "<paste-your-supabase-url>"                   # e.g. https://xyzcompany.supabase.co
+  SUPABASE_SERVICE_ROLE: "<paste-your-supabase-service-key>"  # server-only; NEVER expose client-side
+  FRONTEND_ORIGIN: "https://aihub.lovable.dev"                # change to your domain
+  SCRAPER_USER_AGENT: "AI-Tool-Hub/1.0 (contact: admin@yourdomain.com)"
+  SCRAPER_MAX_TOOLS: "5000"
+
+# --------------------------------
+# 1) Database Schema + Security
+# --------------------------------
+sql:
+  create extension if not exists pg_trgm;
+  create extension if not exists unaccent;
+
+  create table if not exists ai_tools (
+    id            bigserial primary key,
+    name          text not null,
+    url           text not null,
+    description   text,
+    image_url     text,
+    category      text,
+    source        text,              -- where it was found (domain or label)
+    last_seen     timestamptz default now(),
+    tsv           tsvector
+  );
+
+  -- Unique URL for clean upserts (case-insensitive)
+  create unique index if not exists uniq_ai_tools_url on ai_tools ((lower(url)));
+
+  -- Search vector + trigger
+  create or replace function ai_tools_tsv_refresh() returns trigger as $$
+  begin
+    new.tsv := to_tsvector('simple',
+      unaccent(coalesce(new.name,'') || ' ' || coalesce(new.description,'')));
+    return new;
+  end $$ language plpgsql;
+
+  drop trigger if exists trg_ai_tools_tsv on ai_tools;
+  create trigger trg_ai_tools_tsv before insert or update on ai_tools
+  for each row execute function ai_tools_tsv_refresh();
+
+  -- Helpful indexes
+  create index if not exists idx_ai_tools_name_trgm on ai_tools using gin (name gin_trgm_ops);
+  create index if not exists idx_ai_tools_category  on ai_tools (category);
+  create index if not exists idx_ai_tools_tsv       on ai_tools using gin (tsv);
+
+  -- RLS: public read-only
+  alter table ai_tools enable row level security;
+  drop policy if exists p_ai_tools_public_read on ai_tools;
+  create policy p_ai_tools_public_read on ai_tools for select using (true);
+  -- (No INSERT/UPDATE/DELETE policies for anon → writes blocked.)
+
+  -- Public view (no sensitive/internal columns)
+  create or replace view ai_tools_public as
+  select id, name, url, description, image_url, category, source, last_seen
+  from ai_tools;
+
+  -- RPC: secure search (caps + pagination)
+  create or replace function public.search_tools_secure(
+    q text default '',
+    cat text default null,
+    page_limit int default 24,
+    page_offset int default 0
+  ) returns setof ai_tools_public
+  language sql
+  security definer
+  set search_path = public
+  as $$
+    with p as (
+      select
+        coalesce(q,'') q,
+        nullif(cat,'') cat,
+        greatest(1, least(coalesce(page_limit,24), 48)) lim,
+        greatest(0, coalesce(page_offset,0)) off
+    )
+    select id, name, url, description, image_url, category, source, last_seen
+    from ai_tools
+    where
+      ((select q from p) = '' or
+       tsv @@ plainto_tsquery('simple', (select q from p)) or
+       name ilike '%' || (select q from p) || '%' or
+       description ilike '%' || (select q from p) || '%')
+      and ((select cat from p) is null or category = (select cat from p))
+    order by last_seen desc, id desc
+    limit (select lim from p) offset (select off from p);
+  $$;
+
+  -- RPC: list distinct categories
+  create or replace function public.list_categories()
+  returns table(category text) language sql security definer set search_path = public as $$
+    select category
+    from ai_tools
+    where category is not null and category <> ''
+    group by category
+    order by category;
+  $$;
+
+  -- RPC: bulk upsert from JSON (bypasses RLS via SECURITY DEFINER)
+  create or replace function public.upsert_tools_json(rows jsonb)
+  returns integer
+  language plpgsql
+  security definer
+  set search_path = public
+  as $$
+  declare
+    n int := 0;
+  begin
+    with data as (
+      select
+        trim(both from left(x->>'name', 200))        as name,
+        x->>'url'                                    as url,
+        left(coalesce(x->>'description',''), 240)    as description,
+        nullif(x->>'image_url','')                   as image_url,
+        nullif(left(coalesce(x->>'category',''), 80),'') as category,
+        nullif(x->>'source','')                      as source,
+        coalesce((x->>'last_seen')::timestamptz, now()) as last_seen
+      from jsonb_array_elements(rows) as x
+    )
+    insert into ai_tools (name,url,description,image_url,category,source,last_seen)
+    select name,url,description,image_url,category,source,last_seen
+    from data
+    on conflict ((lower(url))) do update
+      set name        = excluded.name,
+          description = excluded.description,
+          image_url   = excluded.image_url,
+          category    = excluded.category,
+          source      = excluded.source,
+          last_seen   = excluded.last_seen;
+    get diagnostics n = row_count;
+    return n;
+  end; $$;
+
+  -- Tiny starter rows so UI has content immediately (neutral + Clearbit logos)
+  insert into ai_tools (name,url,description,category,image_url,source) values
+  ('ChatGPT','https://chat.openai.com','AI chatbot for text generation','Text','https://logo.clearbit.com/openai.com','starter'),
+  ('Claude','https://anthropic.com','Helpful AI assistant','Text','https://logo.clearbit.com/anthropic.com','starter'),
+  ('Perplexity AI','https://perplexity.ai','Answer engine with citations','Search','https://logo.clearbit.com/perplexity.ai','starter')
+  on conflict do nothing;
+
+# --------------------------------
+# 2) Backend APIs (CORS + rate limit) + Universal Scraper (Admin-only)
+# --------------------------------
+backend:
+  cors:
+    allow_origins: [ $FRONTEND_ORIGIN ]
+    allow_methods: ["GET","POST"]
+    allow_headers: ["Content-Type","Authorization"]
+  rate_limit:
+    window_ms: 60000
+    max: 60
+    message: "Rate limit exceeded. Please slow down."
+
+  # ---- Public read-only endpoints (RLS enforced) ----
+  - name: get_tools
+    method: GET
+    path: /api/tools
+    handler: sql
+    query: |
+      select * from search_tools_secure(
+        q := :search,
+        cat := :category,
+        page_limit := :limit,
+        page_offset := :offset
+      );
+    params:
+      - { name: search,   in: query, required: false }
+      - { name: category, in: query, required: false }
+      - { name: limit,    in: query, required: false, default: 24 }
+      - { name: offset,   in: query, required: false, default: 0 }
+
+  - name: get_categories
+    method: GET
+    path: /api/categories
+    handler: sql
+    query: |
+      select * from list_categories();
+
+  # ---- Admin-only: Universal anchor+tag scraper + bulk upsert (up to 5000) ----
+  # Auth: Bearer $SUPABASE_SERVICE_ROLE (server-only; do NOT call from browser).
+  - name: refresh_tools
+    method: POST
+    path: /api/admin/refresh
+    auth: bearer
+    token: $SUPABASE_SERVICE_ROLE
+    handler: node
+    code: |
+      import fetch from "node-fetch";
+      import * as cheerio from "cheerio";
+      import puppeteer from "puppeteer";
+
+      const SUPABASE_URL = process.env.SUPABASE_URL;
+      const SERVICE_KEY  = process.env.SUPABASE_SERVICE_ROLE;
+      const UA           = process.env.SCRAPER_USER_AGENT || "AI-Tool-Hub";
+      const CAP          = Number(process.env.SCRAPER_MAX_TOOLS || "5000");
+
+      // === Input format (flexible) ===
+      // POST body (optional) to override/extend sources:
+      // {
+      //   "sources": [
+      //     {
+      //       "label": "toolify",
+      //       "url": "https://www.toolify.ai/",
+      //       "item": "a[href*='/tool/'], a[href*='/tools/']",
+      //       "name": "self, [data-testid='tool-card-title'], h3, .title",
+      //       "href": "self",          // "self" = read href from the item itself; otherwise provide subselector, e.g. "a"
+      //       "tag":  ".category, .tag, .badge"
+      //     }
+      //   ]
+      // }
+      //
+      // If no body provided, we use the defaults below.
+
+      const DEFAULT_SOURCES = [
+        {
+          label: "toolify",
+          url: "https://www.toolify.ai/",
+          item: "a[href*='/tool/'], a[href*='/tools/']",
+          name: "self, [data-testid='tool-card-title'], h3, .title",
+          href: "self",
+          tag:  "[data-testid='tool-card-category'], .category, .badge, [class*='tag']"
+        },
+        {
+          label: "aitoolsdirectory",
+          url: "https://aitoolsdirectory.com/",
+          item: "a[href*='/tool/'], a[href*='/ai-']",
+          name: "self, h3, h2, .card-title, .listing-title",
+          href: "self",
+          tag:  ".badge, .tag, .category"
+        },
+        {
+          label: "aibase",
+          url: "https://aibase.com/",
+          item: "a[href*='/tools/'], a[href*='/tool/']",
+          name: "self, h3, .title",
+          href: "self",
+          tag:  ".category, .tag"
+        },
+        {
+          label: "theresanaiforthat",
+          url: "https://theresanaiforthat.com/",
+          item: "a[href*='/ai/'], a[href*='/tool/']",
+          name: "self, h3, h2, .title",
+          href: "self",
+          tag:  ".category, .tag, .badge"
+        }
+      ];
+
+      // --- Helpers ---
+      const normalizeDesc = (name, cat) => {
+        const base = `${name} — AI tool`;
+        return cat ? `${base} for ${cat.toLowerCase()}` : base;
+      };
+      const clearbitLogo = (absUrl) => {
+        try { return `https://logo.clearbit.com/${new URL(absUrl).hostname}`; }
+        catch { return null; }
+      };
+      const abs = (href, base) => {
+        try { return new URL(href, base).href; } catch { return null; }
+      };
+      const trim1 = (s) => (s || "").replace(/\s+/g," ").trim();
+
+      function normalizeCategory(c) {
+        if (!c) return null;
+        const s = c.toLowerCase();
+        if (s.includes("image") || s.includes("photo")) return "Images";
+        if (s.includes("video")) return "Video";
+        if (s.includes("audio") || s.includes("voice") || s.includes("music")) return "A

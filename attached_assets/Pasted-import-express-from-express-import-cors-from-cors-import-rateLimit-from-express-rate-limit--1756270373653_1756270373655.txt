@@ -1,0 +1,123 @@
+import express from "express";
+import cors from "cors";
+import rateLimit from "express-rate-limit";
+import pkg from "pg";
+import puppeteer from "puppeteer";
+import * as cheerio from "cheerio";
+
+const { Pool } = pkg;
+
+// --- SECURITY: DB Connection + RLS Enforced ---
+const pool = new Pool({ connectionString: process.env.DATABASE_URL });
+
+// --- Express App ---
+const app = express();
+app.use(express.json());
+app.use(
+  cors({
+    origin: ["https://yourdomain.com"], // allowlist only
+    methods: ["GET", "POST"],
+  })
+);
+app.use(rateLimit({ windowMs: 60 * 1000, max: 60 })); // 60 req/min
+
+// --- DB Init ---
+async function initDB() {
+  await pool.query(`
+    create table if not exists ai_tools (
+      id uuid default gen_random_uuid() primary key,
+      name text,
+      url text unique,
+      category text,
+      seo_description text,
+      image_url text,
+      last_seen timestamptz default now()
+    );
+  `);
+}
+initDB();
+
+// --- Scraper: universal anchors + tags + SEO desc ---
+async function scrapeSite(url, anchorSel, tagSel) {
+  const browser = await puppeteer.launch({ headless: "new" });
+  const page = await browser.newPage();
+  await page.goto(url, { waitUntil: "domcontentloaded" });
+  const html = await page.content();
+  const $ = cheerio.load(html);
+
+  const tools = [];
+  $(anchorSel).each((_, el) => {
+    const name = $(el).text().trim();
+    const href = $(el).attr("href");
+    if (!name || !href) return;
+
+    const tags = [];
+    $(el).parent().find(tagSel).each((_, t) => tags.push($(t).text().trim()));
+
+    // Try meta desc
+    const description =
+      $('meta[name="description"]').attr("content") ||
+      $('meta[property="og:description"]').attr("content") ||
+      `${name} is an AI tool for ${tags.join(", ") || "general use"}.`;
+
+    tools.push({
+      name,
+      url: href.startsWith("http") ? href : `${url}${href}`,
+      category: tags.join(", ") || "Uncategorized",
+      seo_description: description,
+      image_url: `https://logo.clearbit.com/${new URL(
+        href.startsWith("http") ? href : `${url}${href}`
+      ).hostname}`,
+    });
+  });
+
+  await browser.close();
+  return tools;
+}
+
+// --- Upsert Logic ---
+async function upsertTools(tools) {
+  for (const tool of tools) {
+    await pool.query(
+      `
+      insert into ai_tools (name, url, category, seo_description, image_url, last_seen)
+      values ($1,$2,$3,$4,$5,now())
+      on conflict (url) do update
+      set name=excluded.name,
+          category=excluded.category,
+          seo_description=excluded.seo_description,
+          image_url=excluded.image_url,
+          last_seen=now();
+    `,
+      [tool.name, tool.url, tool.category, tool.seo_description, tool.image_url]
+    );
+  }
+}
+
+// --- API Routes ---
+app.get("/api/tools", async (req, res) => {
+  const { q, category } = req.query;
+  let sql = "select * from ai_tools where 1=1";
+  const params = [];
+  if (q) {
+    params.push(`%${q}%`);
+    sql += ` and (name ilike $${params.length} or seo_description ilike $${params.length})`;
+  }
+  if (category) {
+    params.push(category);
+    sql += ` and category ilike $${params.length}`;
+  }
+  sql += " order by last_seen desc limit 50";
+  const { rows } = await pool.query(sql, params);
+  res.json(rows);
+});
+
+app.post("/api/scrape", async (req, res) => {
+  const { url, anchorSel, tagSel } = req.body;
+  const tools = await scrapeSite(url, anchorSel, tagSel);
+  await upsertTools(tools);
+  res.json({ inserted: tools.length });
+});
+
+// --- Server ---
+app.listen(3000, () => console.log("✅ Backend running on port 3000"));
